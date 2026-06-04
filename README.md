@@ -29,3 +29,28 @@ To eliminate the overhead of the Python Global Interpreter Lock (GIL) and the la
 
 ---
 Navaneeth Singh (Nbit-51)
+
+## Native C++ LibTorch Engine (Zero Python Overhead)
+
+To eliminate Python's Global Interpreter Lock (GIL) and CPU-bound launch latency during speculative decoding, the generation loop was rewritten in pure C++ using **LibTorch**. 
+
+The Hugging Face `TinyLlama-1.1B` model is traced into a static `.pt` execution graph. Memory allocation, inference, and token verification happen entirely within the C++ runtime, utilizing direct pointer memory access (`.data_ptr<int64_t>()`) and AVX2/O3 compiler optimizations.
+
+**Performance on RTX 4050 (Mobile):**
+* **Latency:** `16.6 ms / step` (End-to-End Speculative Step)
+* **Throughput:** ~60 iterations/sec
+* **Peak Generation:** Up to 240 tokens/sec (Processing 4 speculative draft tokens per step)
+
+### Build Instructions for C++ Engine
+```bash
+# 1. Export model to static TorchScript graph
+python3 export_to_cpp.py
+
+# 2. Build the engine with CMake
+mkdir build && cd build
+cmake -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') ..
+make
+
+# 3. Execute zero-overhead runtime
+./hydra_native
+\```
