@@ -1,12 +1,15 @@
-import torch, time, os
+import torch
+import time
+import os
+import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from kernels import fast_fused_norm
-import hydra_cpp
 
 # 1. SETUP - Scaling up to 1.1B to show the Hydra Advantage
 MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+if tokenizer.pad_token is None: 
+    tokenizer.pad_token = tokenizer.eos_token
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=True, 
@@ -15,19 +18,68 @@ bnb_cfg = BitsAndBytesConfig(
 )
 
 def patch_model(model):
-    from transformers.models.llama.modeling_llama import LlamaRMSNorm
-    def patched_forward(instance, x):
-        # Fusing RMSNorm + Residual Zero-Init
-        return fast_fused_norm(x, torch.zeros_like(x), instance.weight, instance.variance_epsilon)
-    for m in model.modules():
-        if isinstance(m, LlamaRMSNorm): 
-            m.forward = patched_forward.__get__(m, LlamaRMSNorm)
-    return model
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    
+    def patched_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        **kwargs
+    ):
+        # 1. Input Layernorm (uses Triton RMSNorm without residual addition)
+        residual = hidden_states
+        hidden_states = fast_fused_norm(
+            hidden_states, 
+            torch.zeros_like(hidden_states), 
+            self.input_layernorm.weight, 
+            self.input_layernorm.variance_epsilon
+        )
+        
+        # 2. Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs
+        )
+        
+        # 3. Fused Post-Attention RMSNorm + Residual Addition
+        # Updates 'residual' in-place to (residual + hidden_states) and returns normalized output
+        normalized_output = fast_fused_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon
+        )
+        
+        # 4. MLP
+        hidden_states = self.mlp(normalized_output)
+        
+        # 5. Final residual addition of the MLP block (residual now contains the sum)
+        hidden_states.add_(residual)
+        
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+            
+        return outputs
 
-print("\n--- LOADING MODELS (This may take a minute for 1.1B) ---")
-model_base = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=bnb_cfg, device_map="auto")
-model_hydra = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=bnb_cfg, device_map="auto")
-model_hydra = patch_model(model_hydra)
+    for m in model.modules():
+        if isinstance(m, LlamaDecoderLayer): 
+            m.forward = patched_forward.__get__(m, LlamaDecoderLayer)
+            
+    return model
 
 @torch.inference_mode()
 def run_bench(model, name):
@@ -52,7 +104,19 @@ def run_bench(model, name):
     print(f"[{name}] Avg Time: {avg_time:.4f}s | Throughput: {tps:.2f} tokens/s")
     return tps
 
+print("\n--- LOADING BASELINE MODEL ---")
+model_base = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=bnb_cfg, device_map="auto")
 tps_base = run_bench(model_base, "BASELINE PYTORCH")
+
+# Aggressive cleanup of baseline model to free VRAM before loading Hydra
+print("\nCleaning up baseline model from memory...")
+del model_base
+gc.collect()
+torch.cuda.empty_cache()
+
+print("\n--- LOADING HYDRA MODEL (with Triton optimizations) ---")
+model_hydra = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=bnb_cfg, device_map="auto")
+model_hydra = patch_model(model_hydra)
 tps_hydra = run_bench(model_hydra, "HYDRA (TRITON+C++)")
 
 speedup = (tps_hydra / tps_base)
