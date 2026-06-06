@@ -1,9 +1,12 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <cstdint>
 
-// Ultra-optimized verification with SIMD and early exit
-int verify_matches_simd(const int64_t* draft, const int64_t* target, int size);
+// Core SIMD verification (defined in extension.cpp)
+int verify_matches_simd(const int64_t* __restrict__ draft, 
+                        const int64_t* __restrict__ target, 
+                        int size);
 
-// Main function with optimized memory handling
+// Python-facing wrapper (handles GPU->CPU transfer)
 int verify_matches(torch::Tensor draft_ids, torch::Tensor target_preds);
