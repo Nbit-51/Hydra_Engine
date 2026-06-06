@@ -11,8 +11,7 @@
 //   7. Fast-path for small arrays (draft_len <= 4)
 // ============================================================
 
-#include <torch/extension.h>
-#include <pybind11/pybind11.h>
+#include <torch/torch.h>
 #include <cstring>
 #include <cstdint>
 

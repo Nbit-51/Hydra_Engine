@@ -1,9 +1,21 @@
-venv/
-.venv*/
-__pycache__/
-*.so
-build/
-*.lock
-.cache/
-*.safetensors
+# Model files
+*.pt
 *.bin
+*.safetensors
+TinyLlama-1.1B-Chat-v1.0/
+TinyLlama-1.1B-Chat-v1.0-git/
+
+# Build artifacts
+build/
+*.so
+*.o
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+
+# Misc
+.DS_Store

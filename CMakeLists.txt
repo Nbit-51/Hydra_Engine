@@ -30,7 +30,6 @@ else()
     # Linux GCC/Clang: maximum optimization
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mtune=native -ffast-math")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fomit-frame-pointer -funroll-loops -fprefetch-loop-arrays")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")  # Faster (we use try/catch minimally)
     
     # Check for AVX2
     include(CheckCXXCompilerFlag)
