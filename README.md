@@ -1,5 +1,7 @@
 # Hydra Engine
+# Hydra Engine: High-Performance LLM Inference Infrastructure
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Nbit-51/Hydra_Engine)
 Zero-latency LLM inference infrastructure built on Triton GPU kernels, LibTorch (C++), CUDA Graphs, and AVX2 SIMD. Bypasses Python's GIL and global memory bandwidth bottlenecks, achieving **1.68x+ speedup** over standard PyTorch.
 
 ---
