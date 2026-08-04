@@ -1,165 +1,170 @@
 #include <torch/script.h>
-#include <torch/torch.h>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <vector>
-#include "extension.h"
-#include <cuda_runtime.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAGraph.h>
+#include <string>
+#include <chrono>
+#include <cstdint>
 
-int main() {
-    std::cout << "\n=== HYDRA C++ ENGINE - CUDA GRAPH EDITION ===" << std::endl;
+struct Vocab {
+    std::vector<std::string> pieces;
+    uint32_t eos_id = 0;
+    bool load(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        uint32_t n = 0;
+        f.read(reinterpret_cast<char*>(&n), 4);
+        f.read(reinterpret_cast<char*>(&eos_id), 4);
+        pieces.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t len = 0;
+            f.read(reinterpret_cast<char*>(&len), 4);
+            pieces[i].resize(len);
+            if (len) f.read(&pieces[i][0], len);
+        }
+        return (bool)f;
+    }
+};
+
+static size_t utf8_pending(const std::string& s) {
+    for (size_t i = 1; i <= 3 && i <= s.size(); ++i) {
+        unsigned char c = (unsigned char)s[s.size() - i];
+        if ((c & 0x80) == 0) return 0;
+        if ((c & 0xC0) == 0xC0) {
+            int need = (c & 0xF0) == 0xF0 ? 4 : ((c & 0xE0) == 0xE0 ? 3 : 2);
+            return (int)i < need ? i : 0;
+        }
+    }
+    return 0;
+}
+
+struct Streamer {
+    std::string pending;
+    void feed(const std::string& piece) {
+        pending += piece;
+        size_t keep = utf8_pending(pending);
+        size_t out_len = pending.size() - keep;
+        if (out_len) {
+            std::cout.write(pending.data(), out_len);
+            std::cout.flush();
+            pending = pending.substr(out_len);
+        }
+    }
+    void end() {
+        std::cout.write(pending.data(), pending.size());
+        std::cout.flush();
+    }
+};
+
+static std::vector<int64_t> parse_ids(const std::string& s) {
+    std::vector<int64_t> ids;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (!tok.empty()) ids.push_back(std::stoll(tok));
+    }
+    return ids;
+}
+
+// FIXED: Eliminated the double CPU-GPU sync!
+static int64_t sample(torch::Tensor logits, float temp = 0.7, int top_k = 40) {
+    auto next_logits = logits / temp;
+    auto topk = torch::topk(next_logits, top_k, -1);
+    auto values = std::get<0>(topk).squeeze(0);
+    auto indices = std::get<1>(topk).squeeze(0);
+    auto probs = torch::softmax(values, -1);
+    
+    // Get the index inside the top-k array (e.g., index 2)
+    auto next_token_idx = torch::multinomial(probs, 1);
+    
+    // Gather the ACTUAL token ID from the indices array ON THE GPU
+    auto chosen_token = indices.gather(0, next_token_idx);
+    
+    // Only ONE CPU-GPU sync instead of two!
+    return chosen_token.item<int64_t>();
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "usage: " << argv[0] << " model.pt vocab.bin \"id1,id2,...\" [max_tokens]" << std::endl;
+        return 1;
+    }
+    std::string model_path = argv[1];
+    std::string vocab_path = argv[2];
+    auto prompt_ids = parse_ids(argv[3]);
+    int max_tokens = argc > 4 ? std::atoi(argv[4]) : 128;
 
     torch::Device device(torch::kCUDA);
     at::globalContext().setAllowTF32CuBLAS(true);
     at::globalContext().setAllowTF32CuDNN(true);
-    at::globalContext().setBenchmarkCuDNN(true);
     torch::NoGradGuard no_grad;
 
-    std::cout << "[1/5] Loading model..." << std::endl;
+    Vocab vocab;
+    if (!vocab.load(vocab_path)) {
+        std::cerr << "cannot load vocab " << vocab_path << std::endl;
+        return 1;
+    }
+
     torch::jit::script::Module model;
     try {
-        model = torch::jit::load("hydra_1_1B.pt", device);
+        model = torch::jit::load(model_path, device);
         model.eval();
     } catch (const c10::Error& e) {
         std::cerr << "FATAL: " << e.what() << std::endl;
-        return -1;
+        return 1;
     }
 
-    std::cout << "[2/5] Allocating memory..." << std::endl;
+    auto opts = torch::TensorOptions().dtype(torch::kLong).device(device);
+    Streamer streamer;
 
-    constexpr int64_t seq_len    = 8;
-    constexpr int64_t draft_len  = 4;
-    constexpr int64_t vocab_size = 32000;
-    constexpr int64_t slice_start = seq_len - draft_len;  // 4
-    constexpr int64_t slice_end   = seq_len;              // 8
-
-    auto gpu_long = torch::TensorOptions().dtype(torch::kLong).device(device);
-    auto pin_long = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(true);
-
-    // Static input tensor — MUST be the same tensor for CUDA graph replay
-    auto input_ids    = torch::randint(0, vocab_size, {1, seq_len}, gpu_long);
-    auto target_cpu_0 = torch::empty({draft_len}, pin_long);
-    auto target_cpu_1 = torch::empty({draft_len}, pin_long);
-    auto draft_cpu    = torch::empty({draft_len}, pin_long);
-
-    std::vector<torch::jit::IValue> inputs;
-    inputs.push_back(input_ids);
-
-    auto compute_stream = c10::cuda::getCurrentCUDAStream();
-    auto copy_stream    = c10::cuda::getStreamFromPool(false);
-
-    // 3. WARMUP on default stream
-    std::cout << "[3/5] Warming up (30 iters)..." << std::endl;
-    for (int i = 0; i < 30; ++i) {
-        auto logits = model.forward(inputs).toTensor();
-        if (i == 29) {
-            auto tokens = logits.slice(1, slice_start, slice_end).argmax(-1).view({draft_len});
-            draft_cpu.copy_(tokens, false);
-            std::cout << "  Draft seeded from real predictions" << std::endl;
-        }
-    }
-    torch::cuda::synchronize();
-
-    // 4. CUDA GRAPH CAPTURE
-    std::cout << "[4/5] Capturing CUDA Graph..." << std::endl;
-
-    bool use_cuda_graph = false;
-    at::cuda::CUDAGraph cuda_graph;
-    torch::Tensor graph_logits;
-
-    try {
-        auto capture_stream = c10::cuda::getStreamFromPool(false);
-
-        // Warmup on capture stream (mandatory)
-        {
-            c10::cuda::CUDAStreamGuard g(capture_stream);
-            for (int i = 0; i < 5; ++i)
-                model.forward(inputs).toTensor();
-        }
-        torch::cuda::synchronize();
-
-        // Capture on same stream
-        {
-            c10::cuda::CUDAStreamGuard g(capture_stream);
-            cuda_graph.capture_begin();
-            graph_logits = model.forward(inputs).toTensor();
-            cuda_graph.capture_end();
-        }
-        torch::cuda::synchronize();
-
-        // Verify replay
-        cuda_graph.replay();
-        torch::cuda::synchronize();
-
-        use_cuda_graph = true;
-        std::cout << "  [OK] CUDA Graph captured! Output: [1,"
-                  << graph_logits.size(1) << "," << graph_logits.size(2) << "]" << std::endl;
-
-    } catch (const std::exception& e) {
-        use_cuda_graph = false;
-        std::cout << "  [FAIL] " << e.what() << std::endl;
+    for (auto id : prompt_ids) {
+        if (id >= 0 && (size_t)id < vocab.pieces.size()) streamer.feed(vocab.pieces[id]);
     }
 
-    // 5. BENCHMARK
-    constexpr int iterations = 300;
-    int total_accepted = 0;
+    // ---------- PREFILL ----------
+    std::vector<int64_t> ids = prompt_ids.empty() ? std::vector<int64_t>{1} : prompt_ids;
+    int64_t n = (int64_t)ids.size();
+    auto input_ids = torch::from_blob(ids.data(), {1, n}, torch::kLong).clone().to(device);
+    auto position_ids = torch::arange(n, torch::kLong).to(device).view({1, n});
 
-    std::cout << "[5/5] Benchmarking " << iterations << " iters ["
-              << (use_cuda_graph ? "CUDA GRAPH" : "Standard") << "]..." << std::endl;
+    std::vector<torch::jit::IValue> pf;
+    pf.push_back(input_ids);
+    pf.push_back(position_ids);
+    pf.push_back((int64_t)n); // Pass seq_len as int!
+    auto logits = model.forward(pf).toTensor();
+    
+    int64_t cur = sample(logits.select(1, n - 1));
+    int64_t pos = n;
 
-    cudaEvent_t evt_start, evt_end;
-    cudaEventCreate(&evt_start);
-    cudaEventCreate(&evt_end);
-    cudaEventRecord(evt_start, compute_stream.stream());
+    // ---------- DECODE ----------
+    auto d_ids = torch::zeros({1, 1}, opts);
+    auto d_pos = torch::zeros({1, 1}, opts);
+    
+    std::vector<torch::jit::IValue> di;
+    di.push_back(d_ids);
+    di.push_back(d_pos);
+    di.push_back((int64_t)pos); // Initial seq_len
 
-    for (int i = 0; i < iterations; ++i) {
-        torch::Tensor logits;
-        if (use_cuda_graph) {
-            cuda_graph.replay();
-            logits = graph_logits;
-        } else {
-            logits = model.forward(inputs).toTensor();
-        }
-
-        auto target_tokens = logits.slice(1, slice_start, slice_end).argmax(-1);
-
-        auto& buf = (i & 1) ? target_cpu_1 : target_cpu_0;
-        {
-            c10::cuda::CUDAStreamGuard g(copy_stream);
-            buf.copy_(target_tokens.view({draft_len}), true);
-        }
-        copy_stream.synchronize();
-
-        total_accepted += verify_matches_simd(
-            draft_cpu.data_ptr<int64_t>(),
-            buf.data_ptr<int64_t>(),
-            (int)draft_len
-        );
-
-        if ((i & 15) == 0)
-            draft_cpu.copy_(target_tokens.view({draft_len}), false);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int generated = 0;
+    for (int i = 0; i < max_tokens; ++i) {
+        if (cur == (int64_t)vocab.eos_id) break;
+        if (cur >= 0 && (size_t)cur < vocab.pieces.size()) streamer.feed(vocab.pieces[cur]);
+        
+        d_ids.fill_(cur);
+        d_pos.fill_(pos);
+        di[2] = (int64_t)(pos + 1); // Update seq_len for current step (ZERO SYNC!)
+        
+        logits = model.forward(di).toTensor();
+        cur = sample(logits.select(1, 0));
+        pos++;
+        generated++;
     }
-
-    cudaEventRecord(evt_end, compute_stream.stream());
-    cudaEventSynchronize(evt_end);
-
-    float ms = 0;
-    cudaEventElapsedTime(&ms, evt_start, evt_end);
-    double ms_per_iter  = ms / iterations;
-    double avg_accepted = (double)total_accepted / iterations;
-
-    std::cout << "\n" << std::string(55, '=') << std::endl;
-    std::cout << "  HYDRA C++ ENGINE - PERFORMANCE REPORT" << std::endl;
-    std::cout << std::string(55, '=') << std::endl;
-    std::cout << "  CUDA Graph:          " << (use_cuda_graph ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "  Avg time/iter:       " << ms_per_iter << " ms" << std::endl;
-    std::cout << "  Throughput:          " << 1000.0/ms_per_iter << " iter/s" << std::endl;
-    std::cout << "  Avg tokens accepted: " << avg_accepted << "/" << draft_len << std::endl;
-    std::cout << std::string(55, '=') << std::endl;
-
-    cudaEventDestroy(evt_start);
-    cudaEventDestroy(evt_end);
+    streamer.end();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::cout << "\n\n[decode] " << generated << " tokens in " << ms << " ms ("
+              << 1000.0 * generated / ms << " tok/s)" << std::endl;
     return 0;
 }

@@ -1,156 +1,69 @@
 import torch
-import os
+import argparse
 from transformers import AutoModelForCausalLM
+from hydra_config import HydraConfig
+from hydra_model import HydraModelForCausalLM
 
-MODEL_ID  = "./TinyLlama-1.1B-Chat-v1.0-git"
-SEQ_LEN   = 8
-# TinyLlama-1.1B constants — hardcoded to eliminate ALL dynamic size() calls
-BATCH         = 1
-NUM_HEADS     = 32
-NUM_KV_HEADS  = 4
-NUM_KV_GROUPS = NUM_HEADS // NUM_KV_HEADS   # 8
-HEAD_DIM      = 64
-HALF_HEAD     = HEAD_DIM // 2               # 32
+def export_model(model_id, output_path):
+    cfg = HydraConfig.from_pretrained(model_id)
+    print(f"Config: {cfg.num_hidden_layers} layers, {cfg.num_attention_heads} Q-heads, {cfg.num_key_value_heads} KV-heads")
 
-print("=== HYDRA EXPORT - CUDA GRAPH EDITION ===\n")
+    dtype = torch.float16
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
 
-print("[1/4] Loading model...")
-full_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, torch_dtype=torch.float16, device_map="cuda"
-)
-full_model.eval()
-device = torch.device("cuda")
+    print("Loading HF weights (loader only, forward is ours)...")
+    hf = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
+    sd = hf.state_dict()
+    del hf
 
-print("[2/4] Pre-computing static tensors...")
-input_ids = torch.randint(0, 32000, (1, SEQ_LEN), device=device)
-pos_ids   = torch.arange(SEQ_LEN, device=device).unsqueeze(0)
+    cfg.qkv_bias = "model.layers.0.self_attn.q_proj.bias" in sd
+    cfg.o_bias = "model.layers.0.self_attn.o_proj.bias" in sd
+    print(f"Detected biases: QKV={cfg.qkv_bias}, O={cfg.o_bias}")
 
-rotary = full_model.model.layers[0].self_attn.rotary_emb
-with torch.no_grad():
-    cos, sin = rotary(full_model.model.embed_tokens(input_ids), pos_ids)
-print(f"  cos: {cos.shape}  sin: {sin.shape}")
+    if "lm_head.weight" not in sd:
+        print("Tied embeddings detected, copying embed weight to lm_head")
+        sd["lm_head.weight"] = sd["model.embed_tokens.weight"].clone()
 
-attn_mask = torch.zeros((1, 1, SEQ_LEN, SEQ_LEN), device=device, dtype=torch.float16)
-causal    = torch.triu(torch.full((SEQ_LEN, SEQ_LEN), float('-inf'), device=device, dtype=torch.float16), diagonal=1)
-attn_mask = attn_mask + causal
+    model = HydraModelForCausalLM(cfg).to(dtype).eval()
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    
+    missing = [k for k in missing if not k.endswith("k_cache") and not k.endswith("v_cache")]
+    print(f"missing keys (excluding cache): {missing}")
+    print(f"unexpected keys (ignored): {unexpected}")
+    assert not missing, "Weight names do not match"
 
-print("[3/4] Patching LlamaAttention.forward with fully static version...")
+    print("Verifying logits against HF reference on CUDA...")
+    device = torch.device("cuda")
+    model = model.to(device)
+    
+    ids = torch.randint(0, cfg.vocab_size, (1, 7), device=device)
+    pos = torch.arange(7, device=device).view(1, 7)
+    
+    with torch.no_grad():
+        ref = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, device_map="cuda")
+        ref_logits = ref(input_ids=ids).logits[:, -1, :]
+        del ref
+        model.reset_cache()
+        our_logits = model(ids, pos)[:, -1, :]
+        diff = (ref_logits - our_logits).abs().max().item()
+        print(f"max abs logit diff: {diff}")
 
-import torch.nn.functional as F
+    print("Tracing model with torch.jit.trace (Preserves FlashAttention)...")
+    dummy_ids = torch.ones((1, 1), dtype=torch.long, device=device)
+    dummy_pos = torch.tensor([[5]], dtype=torch.long, device=device)
+    
+    with torch.no_grad():
+        # Warmup to populate cache buffers before tracing
+        model(dummy_ids, dummy_pos)
+        sm = torch.jit.trace(model, (dummy_ids, dummy_pos), strict=False)
 
-def make_static_attn_forward(layer_idx):
-    def static_forward(self, hidden_states, attention_mask=None,
-                       position_ids=None, past_key_value=None,
-                       output_attentions=False, use_cache=False,
-                       cache_position=None, position_embeddings=None, **kwargs):
+    sm.save(output_path)
+    print(f"Saved {output_path}")
 
-        # Project Q K V — shapes known statically
-        q = self.q_proj(hidden_states)  # [1, seq, num_heads*head_dim]
-        k = self.k_proj(hidden_states)  # [1, seq, num_kv_heads*head_dim]
-        v = self.v_proj(hidden_states)  # [1, seq, num_kv_heads*head_dim]
-
-        # Reshape with HARDCODED constants — no .size() calls
-        q = q.view(BATCH, SEQ_LEN, NUM_HEADS,    HEAD_DIM).transpose(1, 2)  # [1,32,8,64]
-        k = k.view(BATCH, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)  # [1,4,8,64]
-        v = v.view(BATCH, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)  # [1,4,8,64]
-
-        # Apply RoPE using pre-computed cos/sin (passed as position_embeddings)
-        cos, sin = position_embeddings  # both [1, seq, head_dim]
-        cos = cos.unsqueeze(1)  # [1,1,seq,head_dim]
-        sin = sin.unsqueeze(1)  # [1,1,seq,head_dim]
-
-        # rotate_half with HARDCODED slice — no dynamic shape
-        def rotate(x):
-            x1 = x[..., :HALF_HEAD]
-            x2 = x[..., HALF_HEAD:]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q = (q * cos) + (rotate(q) * sin)
-        k = (k * cos) + (rotate(k) * sin)
-
-        # GQA: repeat k,v with HARDCODED n_rep — no dynamic reshape
-        # [1, 4, seq, 64] -> [1, 32, seq, 64]
-        k = k.unsqueeze(2).expand(BATCH, NUM_KV_HEADS, NUM_KV_GROUPS, SEQ_LEN, HEAD_DIM)
-        k = k.reshape(BATCH, NUM_HEADS, SEQ_LEN, HEAD_DIM)
-        v = v.unsqueeze(2).expand(BATCH, NUM_KV_HEADS, NUM_KV_GROUPS, SEQ_LEN, HEAD_DIM)
-        v = v.reshape(BATCH, NUM_HEADS, SEQ_LEN, HEAD_DIM)
-
-        # Scaled dot-product attention
-        scale  = HEAD_DIM ** -0.5
-        scores = torch.matmul(q, k.transpose(2, 3)) * scale  # [1,32,8,8]
-        if attention_mask is not None:
-            scores = scores + attention_mask
-        scores = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out    = torch.matmul(scores, v)  # [1,32,8,64]
-
-        # Merge heads — HARDCODED output shape
-        out = out.transpose(1, 2).reshape(BATCH, SEQ_LEN, NUM_HEADS * HEAD_DIM)
-        out = self.o_proj(out)
-
-        return (out, None, None)
-
-    return static_forward
-
-# Patch every attention layer
-from transformers.models.llama.modeling_llama import LlamaAttention
-for i, layer in enumerate(full_model.model.layers):
-    layer.self_attn.forward = make_static_attn_forward(i).__get__(
-        layer.self_attn, type(layer.self_attn)
-    )
-
-print(f"  Patched {len(full_model.model.layers)} attention layers")
-
-print("[4/4] Building wrapper + tracing...")
-
-class FullyStaticWrapper(torch.nn.Module):
-    def __init__(self, full_model, cos, sin, attn_mask):
-        super().__init__()
-        self.embed_tokens = full_model.model.embed_tokens
-        self.layers       = full_model.model.layers
-        self.norm         = full_model.model.norm
-        self.lm_head      = full_model.lm_head
-        self.register_buffer("cos",       cos)
-        self.register_buffer("sin",       sin)
-        self.register_buffer("attn_mask", attn_mask)
-
-    def forward(self, input_ids):
-        hidden = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            hidden = layer(
-                hidden,
-                attention_mask=self.attn_mask,
-                position_ids=None,
-                position_embeddings=(self.cos, self.sin),
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False,
-            )[0]
-        hidden = self.norm(hidden)
-        return self.lm_head(hidden)
-
-wrapper = FullyStaticWrapper(full_model, cos, sin, attn_mask)
-wrapper.eval()
-
-with torch.no_grad():
-    for _ in range(3):
-        wrapper(input_ids)
-    torch.cuda.synchronize()
-
-    traced = torch.jit.trace(wrapper, input_ids, strict=False)
-    traced = torch.jit.freeze(traced)
-
-    out = traced(input_ids)
-    print(f"  Output: {out.shape}  dtype: {out.dtype}")
-    assert out.shape == (1, SEQ_LEN, 32000)
-
-graph_str = str(traced.graph)
-bad_ops   = ["prim::NumToTensor", "aten::Int(", "floor_divide"]
-found     = [op for op in bad_ops if op in graph_str]
-if found:
-    print(f"  [WARN] Still present: {found}")
-else:
-    print("  [OK] ZERO dynamic ops — CUDA graph WILL work!")
-
-traced.save("hydra_1_1B.pt")
-size_gb = os.path.getsize("hydra_1_1B.pt") / 1e9
-print(f"  Saved: hydra_1_1B.pt ({size_gb:.2f} GB)")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--output", type=str, default="hydra_model.pt")
+    args = parser.parse_args()
+    export_model(args.model_id, args.output)
