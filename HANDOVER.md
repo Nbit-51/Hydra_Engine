@@ -67,8 +67,9 @@ Remaining necessary sync: `sample()`'s `.item<int64_t>()` — structurally requi
   ~/build/hydra_native hydra_model.pt vocab.bin "1,450,7483,310,3444,338" 64
 ```
   Also worth getting TinyLlama's `profile_baseline.py`-equivalent number (edit the model_id in that script) for an honest updated speedup claim.
+  Note: these IDs are TinyLlama-tokenizer-specific (sentencepiece Llama vocab) — do NOT reuse them against Qwen's binary/vocab.bin, they decode to garbage there. Qwen's correct equivalent for "The capital of France is": `785,6722,315,9625,374` (verified in follow-up session, produces coherent continuations).
 - **`max abs logit diff` fluctuates 0.20–0.47 across runs** — suspected fp16/SDPA nondeterminism, not correctness bug so far (output stayed coherent). Watch if it jumps notably higher.
-- **No `nsys` profiling done yet.** Both fixes this session came from log-reading and config diffing, not a profiler trace — worked because the bugs were large-effect. Further gains should be profiler-driven.
+- **nsys profiling done in follow-up session (2026-08-05).** Found and fixed a real bug: `hydra_native` was silently crashing (`std::runtime_error`, NVRTC failing to load `libnvrtc-builtins.so.13.0`) on any decode path that triggers JIT kernel fusion, because NVRTC's builtins plugin is loaded via `dlopen()` at runtime and does not honor the binary's rpath — it only checks `LD_LIBRARY_PATH`. Fix: added the venv's `nvidia/cu13/lib` dir to `LD_LIBRARY_PATH` in `venv/bin/activate`. Without this, native-binary runs that hit JIT fusion crash outright; Python-side torch usage is unaffected since it resolves NVRTC differently. Kernel-level `cuda_gpu_kern_sum` breakdown still not captured cleanly — the crash fix landed first; re-run nsys with correct Qwen IDs above to get the actual kernel time breakdown next session. Raw (non-nsys) decode re-confirmed at 60-67 tok/s post-fix, consistent with the 58.3 tok/s baseline claim.
 
 ## Prioritized next steps
 
