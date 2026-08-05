@@ -25,7 +25,7 @@ class HydraAttention(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads
         self.n_rep = self.num_heads // self.num_kv_heads
         self.head_dim = cfg.head_dim
-        self.max_len = 4096
+        self.max_len = cfg.max_position_embeddings
 
         self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=cfg.qkv_bias)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=cfg.qkv_bias)
@@ -46,7 +46,7 @@ class HydraAttention(nn.Module):
         self.k_cache.zero_()
         self.v_cache.zero_()
 
-    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
         B = hidden.shape[0]
         S = hidden.shape[1]
 
@@ -63,19 +63,24 @@ class HydraAttention(nn.Module):
         self.k_cache.index_copy_(2, pos_idx, k)
         self.v_cache.index_copy_(2, pos_idx, v)
 
-        # THE FIX: .contiguous() is CRITICAL!
-        # Slicing the sequence dimension breaks memory contiguity.
-        # If tensors are not contiguous, PyTorch silently disables FlashAttention
-        # and falls back to the incredibly slow O(N^2) math backend.
-        k_all = self.k_cache[:, :, :seq_len, :].contiguous()
-        v_all = self.v_cache[:, :, :seq_len, :].contiguous()
-
-        # Native GQA + FlashAttention
+        # PREFILL: Use FlashAttention with is_causal=True
         if S > 1:
+            k_all = self.k_cache[:, :, :S, :]
+            v_all = self.v_cache[:, :, :S, :]
+            if self.n_rep > 1:
+                k_all = k_all.repeat_interleave(self.n_rep, dim=1)
+                v_all = v_all.repeat_interleave(self.n_rep, dim=1)
             out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=True)
         else:
-            out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=False)
+            # DECODE: slice cache to actual current length, not the full max_len buffer
+            k_all = self.k_cache[:, :, :cur_len, :]
+            v_all = self.v_cache[:, :, :cur_len, :]
+            if self.n_rep > 1:
+                k_all = k_all.repeat_interleave(self.n_rep, dim=1)
+                v_all = v_all.repeat_interleave(self.n_rep, dim=1)
 
+            out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=False)
+        
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
         return self.o_proj(out)
 
@@ -97,8 +102,8 @@ class HydraLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = HydraMLP(cfg)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), position_ids, seq_len)
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), position_ids, cur_len)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -109,10 +114,10 @@ class HydraBackbone(nn.Module):
         self.layers = nn.ModuleList([HydraLayer(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
-            x = layer(x, position_ids, seq_len)
+            x = layer(x, position_ids, cur_len)
         return self.norm(x)
 
 class HydraModelForCausalLM(nn.Module):
@@ -125,5 +130,5 @@ class HydraModelForCausalLM(nn.Module):
         for layer in self.model.layers:
             layer.self_attn.reset_cache()
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
-        return self.lm_head(self.model(input_ids, position_ids, seq_len))
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
+        return self.lm_head(self.model(input_ids, position_ids, cur_len))

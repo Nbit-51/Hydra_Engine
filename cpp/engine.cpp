@@ -6,6 +6,7 @@
 #include <string>
 #include <chrono>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 struct Vocab {
     std::vector<std::string> pieces;
@@ -67,21 +68,14 @@ static std::vector<int64_t> parse_ids(const std::string& s) {
     return ids;
 }
 
-// FIXED: Eliminated the double CPU-GPU sync!
 static int64_t sample(torch::Tensor logits, float temp = 0.7, int top_k = 40) {
     auto next_logits = logits / temp;
     auto topk = torch::topk(next_logits, top_k, -1);
     auto values = std::get<0>(topk).squeeze(0);
     auto indices = std::get<1>(topk).squeeze(0);
     auto probs = torch::softmax(values, -1);
-    
-    // Get the index inside the top-k array (e.g., index 2)
     auto next_token_idx = torch::multinomial(probs, 1);
-    
-    // Gather the ACTUAL token ID from the indices array ON THE GPU
     auto chosen_token = indices.gather(0, next_token_idx);
-    
-    // Only ONE CPU-GPU sync instead of two!
     return chosen_token.item<int64_t>();
 }
 
@@ -101,10 +95,7 @@ int main(int argc, char** argv) {
     torch::NoGradGuard no_grad;
 
     Vocab vocab;
-    if (!vocab.load(vocab_path)) {
-        std::cerr << "cannot load vocab " << vocab_path << std::endl;
-        return 1;
-    }
+    if (!vocab.load(vocab_path)) { std::cerr << "cannot load vocab\n"; return 1; }
 
     torch::jit::script::Module model;
     try {
@@ -115,12 +106,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    try { model.run_method("reset_cache"); } catch (...) {}
+
     auto opts = torch::TensorOptions().dtype(torch::kLong).device(device);
     Streamer streamer;
-
-    for (auto id : prompt_ids) {
+    for (auto id : prompt_ids)
         if (id >= 0 && (size_t)id < vocab.pieces.size()) streamer.feed(vocab.pieces[id]);
-    }
 
     // ---------- PREFILL ----------
     std::vector<int64_t> ids = prompt_ids.empty() ? std::vector<int64_t>{1} : prompt_ids;
@@ -131,32 +122,40 @@ int main(int argc, char** argv) {
     std::vector<torch::jit::IValue> pf;
     pf.push_back(input_ids);
     pf.push_back(position_ids);
-    pf.push_back((int64_t)n); // Pass seq_len as int!
+    pf.push_back(n);
     auto logits = model.forward(pf).toTensor();
-    
+    cudaDeviceSynchronize();
+
     int64_t cur = sample(logits.select(1, n - 1));
     int64_t pos = n;
 
     // ---------- DECODE ----------
     auto d_ids = torch::zeros({1, 1}, opts);
     auto d_pos = torch::zeros({1, 1}, opts);
-    
     std::vector<torch::jit::IValue> di;
     di.push_back(d_ids);
     di.push_back(d_pos);
-    di.push_back((int64_t)pos); // Initial seq_len
+    di.push_back(pos + 1);  // placeholder, overwritten each iteration below
+
+    // CRITICAL: Warmup iterations to trigger JIT compilation and cuBLAS autotuning
+    d_ids.fill_(cur);
+    d_pos.fill_(pos);
+    for (int i = 0; i < 3; ++i) {
+        model.forward(di);
+    }
+    cudaDeviceSynchronize();
 
     auto t0 = std::chrono::high_resolution_clock::now();
     int generated = 0;
     for (int i = 0; i < max_tokens; ++i) {
         if (cur == (int64_t)vocab.eos_id) break;
         if (cur >= 0 && (size_t)cur < vocab.pieces.size()) streamer.feed(vocab.pieces[cur]);
-        
+
         d_ids.fill_(cur);
         d_pos.fill_(pos);
-        di[2] = (int64_t)(pos + 1); // Update seq_len for current step (ZERO SYNC!)
-        
+        di[2] = pos + 1;
         logits = model.forward(di).toTensor();
+
         cur = sample(logits.select(1, 0));
         pos++;
         generated++;
