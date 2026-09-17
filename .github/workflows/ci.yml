@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - feature/**
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Python validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+
+      - name: Install CPU test dependencies
+        run: python -m pip install -r .github/requirements-ci.txt
+
+      - name: Check Python syntax
+        run: |
+          python -m compileall -q \
+            hydra_config.py \
+            hydra_model.py \
+            export_to_cpp.py \
+            dump_tokenizer.py \
+            profile_baseline.py \
+            test_models.py
+
+      - name: Run CPU smoke tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check repository whitespace
+        run: git diff --check HEAD^ HEAD

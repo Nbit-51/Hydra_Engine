@@ -3,6 +3,7 @@
 High-performance, general-purpose LLM inference with a custom PyTorch model export path and a native LibTorch C++ decode runtime.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Nbit-51/Hydra_Engine)
+[![CI](https://github.com/Nbit-51/Hydra_Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Nbit-51/Hydra_Engine/actions/workflows/ci.yml)
 
 ## Current Performance
 
@@ -108,6 +109,10 @@ The native binary accepts a comma-separated tokenized prompt:
 The example IDs represent `The capital of France is` for the Qwen tokenizer. Token IDs are tokenizer-specific and must not be reused across model families.
 
 ## Validation
+
+Every push to `main` or a `feature/**` branch and every pull request runs the GitHub Actions CI workflow. It checks active Python files for syntax errors and runs a CPU smoke test covering prefill, KV-cache decode, cache reset, and TorchScript compilation. The CI badge at the top of this README links to the latest result.
+
+Full CUDA evaluation is available through the manual **GPU Evaluation** workflow. It requires a self-hosted Linux runner labeled `self-hosted`, `linux`, `x64`, and `gpu`; GitHub-hosted runners do not provide the NVIDIA environment needed to export and execute Hydra.
 
 Run the general-purpose model harness:
 

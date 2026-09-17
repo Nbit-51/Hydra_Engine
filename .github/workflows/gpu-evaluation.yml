@@ -1,0 +1,88 @@
+name: GPU Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: Hugging Face model identifier
+        required: true
+        default: Qwen/Qwen2.5-0.5B
+        type: string
+      prompt_ids:
+        description: Comma-separated token IDs from the selected model tokenizer
+        required: true
+        default: 785,6722,315,9625,374
+        type: string
+      max_tokens:
+        description: Number of tokens to decode
+        required: true
+        default: "64"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-evaluation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: CUDA export, build, and inference
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify NVIDIA runtime
+        run: nvidia-smi
+
+      - name: Create Python environment
+        run: |
+          python3 -m venv .venv-ci
+          .venv-ci/bin/python -m pip install --upgrade pip
+          .venv-ci/bin/python -m pip install -r requirements.txt
+
+      - name: Export model and tokenizer
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+        run: |
+          .venv-ci/bin/python export_to_cpp.py --model_id "$MODEL_ID"
+          .venv-ci/bin/python dump_tokenizer.py --model_id "$MODEL_ID"
+
+      - name: Configure native runtime
+        env:
+          CUDA_HOME: /usr/local/cuda
+        run: |
+          export PATH="$CUDA_HOME/bin:$PATH"
+          export CUDACXX="$CUDA_HOME/bin/nvcc"
+          TORCH_PREFIX="$(.venv-ci/bin/python -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')"
+          cmake -S . -B build-ci \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$TORCH_PREFIX" \
+            -DCUDAToolkit_ROOT="$CUDA_HOME" \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX"
+
+      - name: Build native runtime
+        run: cmake --build build-ci --parallel
+
+      - name: Run native inference
+        env:
+          PROMPT_IDS: ${{ inputs.prompt_ids }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
+        run: |
+          set -o pipefail
+          ./build-ci/hydra_native hydra_model.pt vocab.bin "$PROMPT_IDS" "$MAX_TOKENS" | tee hydra-evaluation.txt
+          grep -q '\[decode\]' hydra-evaluation.txt
+
+      - name: Upload evaluation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydra-gpu-evaluation-${{ github.run_id }}
+          path: hydra-evaluation.txt
+          if-no-files-found: warn
+          retention-days: 14
+
