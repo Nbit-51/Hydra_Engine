@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from transformers import AutoConfig
 
 @dataclass
 class HydraConfig:
@@ -19,6 +18,8 @@ class HydraConfig:
 
     @classmethod
     def from_pretrained(cls, model_name: str):
+        from transformers import AutoConfig
+
         c = AutoConfig.from_pretrained(model_name)
         return cls(
             hidden_size=c.hidden_size,
