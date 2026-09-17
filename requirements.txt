@@ -1,0 +1,8 @@
+﻿torch
+transformers
+accelerate
+triton
+numpy
+safetensors
+sentencepiece
+protobuf

@@ -1,140 +1,152 @@
 # Hydra Engine
-# Hydra Engine: High-Performance LLM Inference Infrastructure
 
-## Official Documentation  :-  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Nbit-51/Hydra_Engine)
+High-performance, general-purpose LLM inference with a custom PyTorch model export path and a native LibTorch C++ decode runtime.
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Nbit-51/Hydra_Engine)
 
-Zero-latency LLM inference infrastructure built on Triton GPU kernels, LibTorch (C++), CUDA Graphs, and AVX2 SIMD. Bypasses Python's GIL and global memory bandwidth bottlenecks, achieving **1.68x+ speedup** over standard PyTorch.
+## Current Performance
 
----
+The current validated implementation is approximately **1.46-1.48x faster than eager PyTorch autoregressive decoding** on the tested configuration.
+
+| Configuration | Result |
+| --- | ---: |
+| Model | Qwen2.5-0.5B |
+| GPU | NVIDIA RTX 4050 Laptop GPU |
+| Environment | WSL2, CUDA, LibTorch |
+| Hugging Face eager PyTorch | 39.86 tokens/s |
+| Hydra Engine | 58.3 tokens/s |
+| Measured speedup | 1.46x |
+
+Results vary with the model, GPU, prompt length, sampling settings, software versions, and thermal state. The earlier **1.68x+** figure was based on an older TinyLlama-specific path and is not presented as the current general-purpose result. TinyLlama and additional model families still need fresh, like-for-like validation.
+
+## How It Works
+
+Hydra exports supported Hugging Face causal language models into a TorchScript module with a decode-oriented execution path. The native C++ runtime loads that module through LibTorch and performs prefill, token-by-token decode, top-k sampling, and token streaming without a Python loop.
+
+Current performance work includes:
+
+- Preallocated key/value caches reused across decode steps.
+- Attention over the actual cache length instead of the model's full maximum context window.
+- Host-tracked cache length, avoiding an unnecessary GPU-to-CPU synchronization each token.
+- Native LibTorch execution with TF32 enabled on supported NVIDIA GPUs.
+- Warmup before decode timing to reduce JIT and library initialization noise.
+- Model configuration extracted from Hugging Face rather than hard-coded for TinyLlama.
+
+## CUDA Graph Status
+
+CUDA Graph compatibility is model-dependent. Operations with dynamic shapes or host-visible scalar conversions may prevent graph capture. When capture is unavailable, inference uses the standard LibTorch execution path instead of failing the entire run.
+
+The checked-in general-purpose runtime currently relies on that standard path while CUDA Graph coverage is expanded and validated model by model. CUDA Graph acceleration therefore must not be assumed for every model or included in benchmark claims unless the run explicitly reports successful capture and replay.
+
+## AVX2 Status
+
+The repository contains an experimental PyBind11 extension with AVX2 token-verification utilities. It is **not integrated into the active native decode path** and does not contribute to the performance result above. AVX2 is therefore not advertised as a current engine acceleration feature.
 
 ## Architecture
 
-### Dual Triton GPU Kernels
-
-Two separate JIT-compiled Triton kernels optimized for distinct workloads:
-
-**`fast_rms_norm`** — Pure RMSNorm kernel for input layernorm. Zero allocation overhead; no `torch.zeros_like` call needed. Approximately 2x faster than the fused path for pure normalization.
-
-**`fast_fused_norm`** — Fused RMSNorm + Residual Addition kernel. Performs three operations in a single GPU pass:
-1. Computes `sum = input + residual`
-2. Stores `sum` back to the residual tensor in-place, saving 50% VRAM bandwidth
-3. Returns `RMSNorm(sum, weight)`
-
-Both kernels use 32-warp autotuning (up to 32 warps × 4 pipeline stages) for maximum SM occupancy, compile-time specialization for power-of-2 hidden dimensions (TinyLlama = 2048), and native `float16`, `bfloat16`, and `float32` support via dtype introspection.
-
----
-
-### CUDA Graph-Accelerated C++ Engine
-
-The entire inference loop compiles to native C++ with CUDA Graph capture:
-
-- **CUDA Graph Replay** — Forward pass captured as a replayable graph, eliminating all kernel launch overhead (~1–3ms savings per step)
-- **Double-Buffered Pinned Memory** — Two pinned CPU buffers alternate to overlap D2H transfers with GPU compute
-- **Async Stream Pipeline** — Dedicated copy stream overlaps data transfers with the next iteration's forward pass
-- **Model Freezing + JIT Optimization** — `torch::jit::freeze()` + `optimize_for_inference()` for constant folding and operation fusion
-- **TF32 Tensor Cores** — Hardware-accelerated matrix multiplication on Ampere/Ada GPUs
-- **CUDA Events Timing** — Microsecond-accurate GPU timing (not wall-clock)
-
----
-
-### C++ Sampling and SIMD Verification
-
-- **Custom Binary Heap** — Flat-array min-heap replaces `std::priority_queue`, eliminating vtable dispatch and heap allocation overhead
-- **Branchless Mismatch Detection** — Uses `__builtin_ctz` / `_BitScanForward` on AVX2 comparison masks to find the first mismatch in a single instruction
-- **Software Prefetch** — `_mm_prefetch` hints pull next iteration's data into L1 cache before SIMD loads
-- **LTO + PGO Ready** — Link-time optimization enabled across all translation units
-
----
-
-## System Architecture
-
 ```mermaid
-graph TD
-    subgraph "Python Environment (Tracer & Benchmarks)"
-        BR["benchmark_report.py<br/>(Sequential Loading / patch_model)"]
-        EX["export_to_cpp.py<br/>(LibTorch Tracer)"]
-        K["kernels.py<br/>(Autotuned Triton Kernel)"]
-    end
-
-    subgraph "C++ Extension Module (pybind11)"
-        BI["bindings.cpp<br/>(Entry point)"]
-        SA["sampling.cpp<br/>(Min-Heap / nth_element)"]
-        EXT["extension.cpp<br/>(AVX2 Verification)"]
-    end
-
-    subgraph "Standalone C++ Native Engine"
-        EN["engine.cpp<br/>(LibTorch Speculative Loop)"]
-        PT["hydra_1_1B.pt<br/>(TorchScript Model Graph)"]
-    end
-
-    BR -->|Monkey-patches LlamaDecoderLayer| K
-    EX -->|Serializes Graph| PT
-    BI -->|Links & Compiles| SA
-    BI -->|Links & Compiles| EXT
-    EN -->|Loads & Runs| PT
-    EN -->|Calls SIMD Match| EXT
+flowchart TD
+    HF["Hugging Face model and configuration"] --> EX["export_to_cpp.py"]
+    EX --> HM["HydraModelForCausalLM"]
+    HM --> TS["hydra_model.pt (TorchScript)"]
+    HF --> TOK["dump_tokenizer.py"]
+    TOK --> VOC["vocab.bin"]
+    TS --> CPP["hydra_native (LibTorch C++)"]
+    VOC --> CPP
+    CPP --> PF["Prefill"]
+    PF --> DE["KV-cached decode loop"]
+    DE --> SM["Top-k sampling and streaming"]
+    DE -. "model-dependent; fallback when unsupported" .-> CG["CUDA Graph path"]
 ```
 
----
+The archived Python/Triton benchmark and the optional PyBind11 sampling extension are separate from the active C++ inference path.
 
 ## Build and Run
 
-### 1. Compile PyBind11 Extension
+### 1. Install Python dependencies
 
 ```bash
-python3 setup.py clean --all
-python3 setup.py build_ext --inplace
+python3 -m pip install -r requirements.txt
 ```
 
-### 2. Run Python Benchmark
+### 2. Export a model and tokenizer
+
+Qwen2.5-0.5B is the currently validated default:
 
 ```bash
-python3 benchmark_report.py
+python3 export_to_cpp.py --model_id "Qwen/Qwen2.5-0.5B"
+python3 dump_tokenizer.py --model_id "Qwen/Qwen2.5-0.5B"
 ```
 
-### 3. Build and Run Standalone C++ Engine
+This produces `hydra_model.pt` and `vocab.bin`.
+
+### 3. Build the native runtime
 
 ```bash
-python3 export_to_cpp.py
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
 
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-
-./hydra_native
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" \
+  -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX"
+cmake --build build -j
 ```
 
----
+If an existing build directory still references an old CUDA compiler such as `/usr/bin/nvcc`, configure a fresh build directory (for example, `build-feature`) with the same options.
 
-## File Structure
+### 4. Run inference
 
-```
-hydra_engine/
-├── kernels.py              # Autotuned Triton RMSNorm + in-place residual addition kernel
-├── benchmark_report.py     # Sequential benchmarking harness with CUDA Events timing
-├── export_to_cpp.py        # LibTorch export with freeze + optimize_for_inference
-├── setup.py                # PyTorch CppExtension build with AVX2/LTO/BMI flags
-├── CMakeLists.txt          # Standalone C++ build with CUDA Graph support
-└── cpp/
-    ├── engine.cpp          # CUDA Graph-accelerated LibTorch runtime
-    ├── bindings.cpp        # PyBind11 extension bindings
-    ├── sampling.cpp/.h     # Custom binary heap top-K filters
-    └── extension.cpp/.h    # AVX2 + CTZ branchless token matching
+The native binary accepts a comma-separated tokenized prompt:
+
+```bash
+./build/hydra_native hydra_model.pt vocab.bin "785,6722,315,9625,374" 64
 ```
 
----
+The example IDs represent `The capital of France is` for the Qwen tokenizer. Token IDs are tokenizer-specific and must not be reused across model families.
 
-## Troubleshooting
+## Validation
 
-**CUDA Graph capture fails** — Some model operations don't support graph capture. The engine automatically falls back to standard execution.
+Run the general-purpose model harness:
 
-**AVX2 not available** — The code automatically falls back to optimized scalar loops with 4x unrolling.
+```bash
+python3 test_models.py
+```
 
-**VRAM OOM** — The benchmark uses sequential loading. Decrease `max_new_tokens` in `benchmark_report.py` if needed.
+Run the eager PyTorch baseline separately:
 
----
+```bash
+python3 profile_baseline.py
+```
+
+For credible comparisons, use the same model, dtype, prompt/decode lengths, sampling behavior, GPU, and software environment. Report prefill and decode separately when possible.
+
+## Repository Layout
+
+```text
+Hydra_Engine/
+|-- hydra_config.py       # Hugging Face configuration adapter
+|-- hydra_model.py        # Exportable model and KV-cache implementation
+|-- export_to_cpp.py      # Weight loading, validation, and TorchScript export
+|-- dump_tokenizer.py     # Binary vocabulary export for the C++ streamer
+|-- profile_baseline.py   # Eager PyTorch decode baseline
+|-- test_models.py        # Multi-model validation harness
+|-- CMakeLists.txt        # Native LibTorch build
+|-- cpp/
+|   `-- engine.cpp        # Prefill, decode, sampling, and streaming runtime
+`-- archive/              # Earlier TinyLlama/Triton benchmark path
+```
+
+## Known Limitations
+
+- Model-family support is still being expanded and must be validated individually.
+- CUDA Graph capture is not available for every exported graph; unsupported models use the normal LibTorch path.
+- The AVX2 verification extension is not wired into active inference.
+- The old Triton RMSNorm path is archived and is not part of the current performance result.
+- Sampling still requires a host-visible token each decode step.
 
 ## Author
 
-**Navaneeth Singh** — [Nbit-51](https://github.com/Nbit-51)
+**Navaneeth Singh** - [Nbit-51](https://github.com/Nbit-51)
