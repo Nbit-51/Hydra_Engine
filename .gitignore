@@ -7,6 +7,7 @@ TinyLlama-1.1B-Chat-v1.0-git/
 
 # Build artifacts
 build/
+build-*/
 *.so
 *.o
 
