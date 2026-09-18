@@ -20,4 +20,3 @@ python3 benchmark_report.py
 ```
 
 The scripts are historical and may require adaptation for current Transformers versions.
-

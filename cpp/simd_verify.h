@@ -15,4 +15,3 @@ int verify_matches_simd(
 );
 
 const char* verify_matches_backend();
-

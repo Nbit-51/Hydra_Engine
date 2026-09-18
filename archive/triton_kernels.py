@@ -94,8 +94,6 @@ def fast_fused_norm(x, residual, weight, eps=1e-6):
         IS_POWER_OF_2=(n_cols & (n_cols - 1)) == 0,
     )
     return output.view(*original_shape)
-
-
 @triton.autotune(
     configs=[
         triton.Config({"num_warps": 4}, num_stages=2),
@@ -161,4 +159,3 @@ def fast_rms_norm(x, weight, eps=1e-6):
         IS_POWER_OF_2=(n_cols & (n_cols - 1)) == 0,
     )
     return output.view(*original_shape)
-

@@ -77,4 +77,3 @@ const char* verify_matches_backend() {
     return "scalar";
 #endif
 }
-

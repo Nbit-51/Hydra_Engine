@@ -43,4 +43,3 @@ int main() {
               << verify_matches_backend() << ")" << std::endl;
     return 0;
 }
-
