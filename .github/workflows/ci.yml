@@ -50,5 +50,30 @@ jobs:
       - name: Run CPU smoke tests
         run: python -m unittest discover -s tests -v
 
+      - name: Verify scalar token matching
+        run: |
+          g++ -std=c++17 -O2 \
+            -Icpp \
+            cpp/simd_verify.cpp \
+            tests/cpp/test_simd_verify.cpp \
+            -o /tmp/hydra-simd-scalar
+          /tmp/hydra-simd-scalar | tee /tmp/hydra-simd-scalar.txt
+          grep -q 'backend: scalar' /tmp/hydra-simd-scalar.txt
+
+      - name: Verify AVX2 token matching
+        if: runner.arch == 'X64'
+        run: |
+          if ! grep -qw avx2 /proc/cpuinfo; then
+            echo 'AVX2 is unavailable on this runner; scalar coverage passed.'
+            exit 0
+          fi
+          g++ -std=c++17 -O2 -mavx2 \
+            -Icpp \
+            cpp/simd_verify.cpp \
+            tests/cpp/test_simd_verify.cpp \
+            -o /tmp/hydra-simd-avx2
+          /tmp/hydra-simd-avx2 | tee /tmp/hydra-simd-avx2.txt
+          grep -q 'backend: avx2' /tmp/hydra-simd-avx2.txt
+
       - name: Check repository whitespace
         run: git diff --check HEAD^ HEAD

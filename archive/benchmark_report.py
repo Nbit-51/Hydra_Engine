@@ -9,7 +9,7 @@ if system_ptxas:
     print(f"[INIT] Using ptxas: {system_ptxas}")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from kernels import fast_fused_norm, fast_rms_norm
+from triton_kernels import fast_fused_norm, fast_rms_norm
 
 MODEL_ID = "./TinyLlama-1.1B-Chat-v1.0-git"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)

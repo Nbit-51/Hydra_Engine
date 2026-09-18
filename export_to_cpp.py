@@ -37,7 +37,7 @@ def export_model(model_id, output_path):
         ref_logits = ref(input_ids=ids).logits[:, -1, :]
         del ref
         model.reset_cache()
-        our_logits = model(ids, pos, ids.shape[1])[:, -1, :]
+        our_logits = model(ids, pos, ids.shape[1], False)[:, -1, :]
         print(f"max abs logit diff: {(ref_logits - our_logits).abs().max().item()}")
 
     print("Compiling with torch.jit.script...")
@@ -46,7 +46,7 @@ def export_model(model_id, output_path):
             sm = torch.jit.script(model)
         except Exception as e:
             print(f"script failed ({e}), tracing instead")
-            sm = torch.jit.trace(model, (ids, pos, ids.shape[1]), strict=False)
+            sm = torch.jit.trace(model, (ids, pos, ids.shape[1], False), strict=False)
     sm.save(output_path)
     print(f"Saved {output_path}")
 

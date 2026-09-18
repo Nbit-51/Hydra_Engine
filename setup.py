@@ -40,7 +40,8 @@ setup(
             sources=[
                 "cpp/bindings.cpp",
                 "cpp/sampling.cpp",
-                "cpp/extension.cpp"
+                "cpp/extension.cpp",
+                "cpp/simd_verify.cpp"
             ],
             extra_compile_args={"cxx": extra_compile_args},
             extra_link_args=extra_link_args,

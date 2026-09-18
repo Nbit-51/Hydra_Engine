@@ -34,11 +34,12 @@ class HydraModelSmokeTest(unittest.TestCase):
         positions = torch.arange(3, dtype=torch.long).view(1, 3)
 
         with torch.no_grad():
-            prefill_logits = self.model(input_ids, positions, 3)
+            prefill_logits = self.model(input_ids, positions, 3, False)
             decode_logits = self.model(
                 torch.tensor([[4]], dtype=torch.long),
                 torch.tensor([[3]], dtype=torch.long),
                 4,
+                False,
             )
 
         self.assertEqual(tuple(prefill_logits.shape), (1, 3, 32))
@@ -55,6 +56,7 @@ class HydraModelSmokeTest(unittest.TestCase):
                 torch.tensor([[1]], dtype=torch.long),
                 torch.tensor([[0]], dtype=torch.long),
                 1,
+                False,
             )
 
         self.model.reset_cache()
@@ -69,12 +71,33 @@ class HydraModelSmokeTest(unittest.TestCase):
                 torch.tensor([[1, 2]], dtype=torch.long),
                 torch.tensor([[0, 1]], dtype=torch.long),
                 2,
+                False,
             )
 
         self.assertEqual(tuple(logits.shape), (1, 2, 32))
         self.assertTrue(torch.isfinite(logits).all().item())
+        scripted.reset_cache()
+        for layer in scripted.model.layers:
+            self.assertEqual(torch.count_nonzero(layer.self_attn.k_cache).item(), 0)
+
+    def test_bucketed_decode_matches_exact_decode(self) -> None:
+        exact = HydraModelForCausalLM(tiny_config()).eval()
+        bucketed = HydraModelForCausalLM(tiny_config()).eval()
+        bucketed.load_state_dict(exact.state_dict())
+
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        positions = torch.arange(3, dtype=torch.long).view(1, 3)
+        next_id = torch.tensor([[4]], dtype=torch.long)
+        next_position = torch.tensor([[3]], dtype=torch.long)
+
+        with torch.no_grad():
+            exact(input_ids, positions, 3, False)
+            bucketed(input_ids, positions, 3, False)
+            exact_logits = exact(next_id, next_position, 4, False)
+            bucketed_logits = bucketed(next_id, next_position, 8, True)
+
+        torch.testing.assert_close(bucketed_logits, exact_logits)
 
 
 if __name__ == "__main__":
     unittest.main()
-

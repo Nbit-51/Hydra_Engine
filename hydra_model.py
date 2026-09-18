@@ -46,7 +46,13 @@ class HydraAttention(nn.Module):
         self.k_cache.zero_()
         self.v_cache.zero_()
 
-    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_len: int,
+        mask_unused_cache: bool,
+    ) -> torch.Tensor:
         B = hidden.shape[0]
         S = hidden.shape[1]
 
@@ -73,13 +79,27 @@ class HydraAttention(nn.Module):
             out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=True)
         else:
             # DECODE: slice cache to actual current length, not the full max_len buffer
-            k_all = self.k_cache[:, :, :cur_len, :]
-            v_all = self.v_cache[:, :, :cur_len, :]
+            k_all = self.k_cache[:, :, :cache_len, :]
+            v_all = self.v_cache[:, :, :cache_len, :]
             if self.n_rep > 1:
                 k_all = k_all.repeat_interleave(self.n_rep, dim=1)
                 v_all = v_all.repeat_interleave(self.n_rep, dim=1)
 
-            out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=False)
+            if mask_unused_cache:
+                # CUDA Graphs require a fixed shape. position_ids remains a static
+                # tensor whose value changes before replay, so this mask excludes
+                # unused entries in the current power-of-two cache bucket.
+                cache_positions = torch.arange(cache_len, device=position_ids.device)
+                valid = cache_positions.view(1, 1, 1, cache_len) <= position_ids[:, -1].view(B, 1, 1, 1)
+                out = F.scaled_dot_product_attention(
+                    q,
+                    k_all,
+                    v_all,
+                    attn_mask=valid,
+                    is_causal=False,
+                )
+            else:
+                out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=False)
         
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
         return self.o_proj(out)
@@ -102,8 +122,19 @@ class HydraLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = HydraMLP(cfg)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), position_ids, cur_len)
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_len: int,
+        mask_unused_cache: bool,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(
+            self.input_layernorm(x),
+            position_ids,
+            cache_len,
+            mask_unused_cache,
+        )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -114,10 +145,16 @@ class HydraBackbone(nn.Module):
         self.layers = nn.ModuleList([HydraLayer(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_len: int,
+        mask_unused_cache: bool,
+    ) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
-            x = layer(x, position_ids, cur_len)
+            x = layer(x, position_ids, cache_len, mask_unused_cache)
         return self.norm(x)
 
 class HydraModelForCausalLM(nn.Module):
@@ -126,9 +163,18 @@ class HydraModelForCausalLM(nn.Module):
         self.model = HydraBackbone(cfg)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
+    @torch.jit.export
     def reset_cache(self):
         for layer in self.model.layers:
             layer.self_attn.reset_cache()
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, cur_len: int) -> torch.Tensor:
-        return self.lm_head(self.model(input_ids, position_ids, cur_len))
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_len: int,
+        mask_unused_cache: bool = False,
+    ) -> torch.Tensor:
+        return self.lm_head(
+            self.model(input_ids, position_ids, cache_len, mask_unused_cache)
+        )

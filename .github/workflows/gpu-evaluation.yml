@@ -18,6 +18,20 @@ on:
         required: true
         default: "64"
         type: string
+      graph_mode:
+        description: CUDA Graph policy
+        required: true
+        default: required
+        type: choice
+        options:
+          - required
+          - auto
+          - off
+      seed:
+        description: Sampling seed
+        required: true
+        default: "1234"
+        type: string
 
 permissions:
   contents: read
@@ -72,17 +86,44 @@ jobs:
         env:
           PROMPT_IDS: ${{ inputs.prompt_ids }}
           MAX_TOKENS: ${{ inputs.max_tokens }}
+          GRAPH_MODE: ${{ inputs.graph_mode }}
+          SEED: ${{ inputs.seed }}
         run: |
           set -o pipefail
-          ./build-ci/hydra_native hydra_model.pt vocab.bin "$PROMPT_IDS" "$MAX_TOKENS" | tee hydra-evaluation.txt
+          ./build-ci/hydra_native \
+            hydra_model.pt \
+            vocab.bin \
+            "$PROMPT_IDS" \
+            "$MAX_TOKENS" \
+            "$GRAPH_MODE" \
+            "$SEED" | tee hydra-evaluation.txt
           grep -q '\[decode\]' hydra-evaluation.txt
+          if [ "$GRAPH_MODE" = required ]; then
+            grep -q '\[cuda-graph\] enabled' hydra-evaluation.txt
+          fi
+
+      - name: Verify automatic graph fallback
+        run: |
+          set -o pipefail
+          .venv-ci/bin/python tests/gpu/export_capture_failure_model.py
+          ./build-ci/hydra_native \
+            capture_failure_model.pt \
+            vocab.bin \
+            "1,2" \
+            4 \
+            auto \
+            1234 2>&1 | tee hydra-fallback.txt
+          grep -q '\[cuda-graph\] capture failed' hydra-fallback.txt
+          grep -q '\[cuda-graph\] disabled; using standard LibTorch decode' hydra-fallback.txt
+          grep -q '\[decode\]' hydra-fallback.txt
 
       - name: Upload evaluation output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hydra-gpu-evaluation-${{ github.run_id }}
-          path: hydra-evaluation.txt
+          path: |
+            hydra-evaluation.txt
+            hydra-fallback.txt
           if-no-files-found: warn
           retention-days: 14
-
